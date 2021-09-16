@@ -21,6 +21,11 @@ from domainbed import algorithms
 from domainbed.lib import misc
 from domainbed.lib.fast_data_loader import InfiniteDataLoader, FastDataLoader
 
+import wandb
+
+def str2bool(v):
+  return str(v).lower() in ("yes", "true", "t", "1")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Domain generalization')
     parser.add_argument('--data_dir', type=str)
@@ -48,7 +53,28 @@ if __name__ == "__main__":
         help="For domain adaptation, % of test to use unlabeled for training.")
     parser.add_argument('--skip_model_save', action='store_true')
     parser.add_argument('--save_model_every_checkpoint', action='store_true')
+    parser.add_argument('--wandb', type=str2bool, default=False)
+    parser.add_argument('--run_name', type=str, default="")
+
+
+    parser.add_argument('--lr_scheduler', action='store_true')
+    parser.add_argument('--gamma', type=float, default=0.1)
+    parser.add_argument('--patience', type=int, default=25)
+
+    parser.add_argument('--sweep_name', type=str, default="")
+
+
     args = parser.parse_args()
+
+    if args.wandb:
+
+        group = args.sweep_name if len(args.sweep_name) else None
+
+        wandb.init(entity="arjunashok", project="domain-bed", config=vars(args), group=group)
+        if args.run_name:
+            wandb.run.name = args.run_name
+        else:
+            wandb.run.name = args.algorithm + "-" + args.task + "-" + ",".join(map(str, args.test_envs))
 
     # If we ever want to implement checkpointing, just persist these values
     # every once in a while, and then load them from disk here.
@@ -89,6 +115,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+    device_count = torch.cuda.device_count()
+
+    print("CUDA device count: ", device_count)
 
     if torch.cuda.is_available():
         device = "cuda"
@@ -179,7 +210,18 @@ if __name__ == "__main__":
     if algorithm_dict is not None:
         algorithm.load_state_dict(algorithm_dict)
 
-    algorithm.to(device)
+
+    if device_count == 1:
+        algorithm.to(device)
+    else:
+        print("DataParallel is applied.")
+        algorithm = torch.nn.DataParallel(algorithm)
+        algorithm.to(device)
+        algorithm = algorithm.module
+
+    if args.lr_scheduler:
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(algorithm.optimizer, mode="min", factor=args.gamma,
+                        patience=args.patience)
 
     train_minibatches_iterator = zip(*train_loaders)
     uda_minibatches_iterator = zip(*uda_loaders)
@@ -206,6 +248,8 @@ if __name__ == "__main__":
 
     last_results_keys = None
     for step in range(start_step, n_steps):
+        cur_epoch = step / steps_per_epoch
+
         step_start_time = time.time()
         minibatches_device = [(x.to(device), y.to(device))
             for x,y in next(train_minibatches_iterator)]
@@ -214,11 +258,18 @@ if __name__ == "__main__":
                 for x,_ in next(uda_minibatches_iterator)]
         else:
             uda_device = None
-        step_vals = algorithm.update(minibatches_device, uda_device)
+        step_vals = algorithm.update(minibatches_device, uda_device) #NOTE: These are training losses
         checkpoint_vals['step_time'].append(time.time() - step_start_time)
 
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
+
+        # if int(cur_epoch) == cur_epoch:
+        #     for name, loader, weights in evals:
+        #         acc = misc.accuracy(algorithm, loader, weights, device) # NOTE: This returns test accuracy
+        #         results[name+'_acc'] = acc
+
+        #     wandb.log()
 
         if (step % checkpoint_freq == 0) or (step == n_steps - 1):
             results = {
@@ -231,7 +282,7 @@ if __name__ == "__main__":
 
             evals = zip(eval_loader_names, eval_loaders, eval_weights)
             for name, loader, weights in evals:
-                acc = misc.accuracy(algorithm, loader, weights, device)
+                acc = misc.accuracy(algorithm, loader, weights, device) # NOTE: This returns test accuracy
                 results[name+'_acc'] = acc
 
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
@@ -242,6 +293,9 @@ if __name__ == "__main__":
                 last_results_keys = results_keys
             misc.print_row([results[key] for key in results_keys],
                 colwidth=12)
+
+            if args.wandb:
+                wandb.log(results, step=step)
 
             results.update({
                 'hparams': hparams,
